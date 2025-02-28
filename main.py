@@ -71,75 +71,64 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
-def run_backend(cfg, model, states, keyframes, K):
-    set_global_config(cfg)
-
-    device = keyframes.device
-    factor_graph = FactorGraph(model, keyframes, K, device)
-    retrieval_database = load_retriever(model)
-
+def run_backend(states, keyframes):
     mode = states.get_mode()
-    while mode is not Mode.TERMINATED:
-        mode = states.get_mode()
-        if mode == Mode.INIT or states.is_paused():
-            time.sleep(0.01)
-            continue
-        if mode == Mode.RELOC:
-            frame = states.get_frame()
-            success = relocalization(frame, keyframes, factor_graph, retrieval_database)
-            if success:
-                states.set_mode(Mode.TRACKING)
-            states.dequeue_reloc()
-            continue
-        idx = -1
-        with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks[0]
-        if idx == -1:
-            time.sleep(0.01)
-            continue
+    if mode == Mode.INIT or states.is_paused():
+        return
+    if mode == Mode.RELOC:
+        frame = states.get_frame()
+        success = relocalization(frame, keyframes, factor_graph, retrieval_database)
+        if success:
+            states.set_mode(Mode.TRACKING)
+        states.dequeue_reloc()
+        return
+    idx = -1
+    with states.lock:
+        if len(states.global_optimizer_tasks) > 0:
+            idx = states.global_optimizer_tasks[0]
+    if idx == -1:
+        return
+    # Graph Construction
+    kf_idx = []
+    # k to previous consecutive keyframes
+    n_consec = 1
+    for j in range(min(n_consec, idx)):
+        kf_idx.append(idx - 1 - j)
+    frame = keyframes[idx]
+    retrieval_inds = retrieval_database.update(
+        frame,
+        add_after_query=True,
+        k=config["retrieval"]["k"],
+        min_thresh=config["retrieval"]["min_thresh"],
+    )
+    kf_idx += retrieval_inds
 
-        # Graph Construction
-        kf_idx = []
-        # k to previous consecutive keyframes
-        n_consec = 1
-        for j in range(min(n_consec, idx)):
-            kf_idx.append(idx - 1 - j)
-        frame = keyframes[idx]
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
+    lc_inds = set(retrieval_inds)
+    lc_inds.discard(idx - 1)
+    if len(lc_inds) > 0:
+        print("Database retrieval", idx, ": ", lc_inds)
+
+    kf_idx = set(kf_idx)  # Remove duplicates by using set
+    kf_idx.discard(idx)  # Remove current kf idx if included
+    kf_idx = list(kf_idx)  # convert to list
+    frame_idx = [idx] * len(kf_idx)
+    if kf_idx:
+        factor_graph.add_factors(
+            kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
         )
-        kf_idx += retrieval_inds
 
-        lc_inds = set(retrieval_inds)
-        lc_inds.discard(idx - 1)
-        if len(lc_inds) > 0:
-            print("Database retrieval", idx, ": ", lc_inds)
+    with states.lock:
+        states.edges_ii[:] = factor_graph.ii.cpu().tolist()
+        states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
-        kf_idx = set(kf_idx)  # Remove duplicates by using set
-        kf_idx.discard(idx)  # Remove current kf idx if included
-        kf_idx = list(kf_idx)  # convert to list
-        frame_idx = [idx] * len(kf_idx)
-        if kf_idx:
-            factor_graph.add_factors(
-                kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
-            )
+    if config["use_calib"]:
+        factor_graph.solve_GN_calib()
+    else:
+        factor_graph.solve_GN_rays()
 
-        with states.lock:
-            states.edges_ii[:] = factor_graph.ii.cpu().tolist()
-            states.edges_jj[:] = factor_graph.jj.cpu().tolist()
-
-        if config["use_calib"]:
-            factor_graph.solve_GN_calib()
-        else:
-            factor_graph.solve_GN_rays()
-
-        with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks.pop(0)
+    with states.lock:
+        if len(states.global_optimizer_tasks) > 0:
+            idx = states.global_optimizer_tasks.pop(0)
 
 
 if __name__ == "__main__":
@@ -222,8 +211,8 @@ if __name__ == "__main__":
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
-    backend.start()
+    factor_graph = FactorGraph(model, keyframes, K, device)
+    retrieval_database = load_retriever(model)
 
     i = 0
     fps_timer = time.time()
@@ -284,25 +273,15 @@ if __name__ == "__main__":
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
-            while config["single_thread"]:
-                with states.lock:
-                    if states.reloc_sem.value == 0:
-                        break
-                time.sleep(0.01)
-
         else:
             raise Exception("Invalid mode")
 
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
-            # In single threaded mode, wait for the backend to finish
-            while config["single_thread"]:
-                with states.lock:
-                    if len(states.global_optimizer_tasks) == 0:
-                        break
-                time.sleep(0.01)
+
+        run_backend(states, keyframes)
+
         # log time
         if i % 30 == 0:
             FPS = i / (time.time() - fps_timer)
@@ -330,6 +309,5 @@ if __name__ == "__main__":
             cv2.imwrite(f"{savedir}/{i}.png", frame)
 
     print("done")
-    backend.join()
     if not args.no_viz:
         viz.join()
