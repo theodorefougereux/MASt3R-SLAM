@@ -8,328 +8,269 @@ import lietorch
 import torch
 import tqdm
 import yaml
-from mast3r_slam.global_opt import FactorGraph
+import torch.multiprocessing as mp
 
 from mast3r_slam.config import load_config, config, set_global_config
 from mast3r_slam.dataloader import Intrinsics, load_dataset
-import mast3r_slam.evaluate as eval
+from mast3r_slam.evaluate import prepare_savedir, save_traj, save_reconstruction, save_keyframes
 from mast3r_slam.frame import Mode, SharedKeyframes, SharedStates, create_frame
-from mast3r_slam.mast3r_utils import (
-    load_mast3r,
-    load_retriever,
-    mast3r_inference_mono,
-)
+from mast3r_slam.global_opt import FactorGraph
+from mast3r_slam.mast3r_utils import load_mast3r, load_retriever, mast3r_inference_mono
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
-import torch.multiprocessing as mp
 
-
-def relocalization(frame, keyframes, factor_graph, retrieval_database):
-    # we are adding and then removing from the keyframe, so we need to be careful.
-    # The lock slows viz down but safer this way...
+# Move this function definition to module level (outside of any other function)
+def relocalize(frame, keyframes, factor_graph, retriever):
     with keyframes.lock:
-        kf_idx = []
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=False,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-        kf_idx += retrieval_inds
-        successful_loop_closure = False
-        if kf_idx:
-            keyframes.append(frame)
-            n_kf = len(keyframes)
-            kf_idx = list(kf_idx)  # convert to list
-            frame_idx = [n_kf - 1] * len(kf_idx)
-            print("RELOCALIZING against kf ", n_kf - 1, " and ", kf_idx)
-            if factor_graph.add_factors(
-                frame_idx,
-                kf_idx,
-                config["reloc"]["min_match_frac"],
-                is_reloc=config["reloc"]["strict"],
-            ):
-                retrieval_database.update(
-                    frame,
-                    add_after_query=True,
-                    k=config["retrieval"]["k"],
-                    min_thresh=config["retrieval"]["min_thresh"],
-                )
-                print("Success! Relocalized")
-                successful_loop_closure = True
-                keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
-            else:
-                keyframes.pop_last()
-                print("Failed to relocalize")
+        candidates = retriever.update(frame, add_after_query=False,
+                                      k=config["retrieval"]["k"],
+                                      min_thresh=config["retrieval"]["min_thresh"])
+        if not candidates:
+            return False
 
-        if successful_loop_closure:
+        keyframes.append(frame)
+        idx = len(keyframes) - 1
+        if factor_graph.add_factors([idx] * len(candidates), list(candidates),
+                                     config["reloc"]["min_match_frac"],
+                                     is_reloc=config["reloc"]["strict"]):
+            retriever.update(frame, add_after_query=True,
+                             k=config["retrieval"]["k"],
+                             min_thresh=config["retrieval"]["min_thresh"])
+            keyframes.T_WC[idx] = keyframes.T_WC[candidates[0]].clone()
             if config["use_calib"]:
                 factor_graph.solve_GN_calib()
             else:
                 factor_graph.solve_GN_rays()
-        return successful_loop_closure
+            return True
 
+        keyframes.pop_last()
+        return False
 
-def run_backend(cfg, model, states, keyframes, K):
+# Define backend_loop at module level
+def backend_loop(cfg, model, states, keyframes, K):
     set_global_config(cfg)
+    factor_graph = FactorGraph(model, keyframes, K, keyframes.device)
+    retriever = load_retriever(model)
 
-    device = keyframes.device
-    factor_graph = FactorGraph(model, keyframes, K, device)
-    retrieval_database = load_retriever(model)
-
-    mode = states.get_mode()
-    while mode is not Mode.TERMINATED:
-        mode = states.get_mode()
-        if mode == Mode.INIT or states.is_paused():
+    while (mode := states.get_mode()) != Mode.TERMINATED:
+        if mode in (Mode.INIT, ) or states.is_paused():
             time.sleep(0.01)
             continue
+
         if mode == Mode.RELOC:
             frame = states.get_frame()
-            success = relocalization(frame, keyframes, factor_graph, retrieval_database)
-            if success:
+            if relocalize(frame, keyframes, factor_graph, retriever):
                 states.set_mode(Mode.TRACKING)
             states.dequeue_reloc()
             continue
-        idx = -1
+
         with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks[0]
-        if idx == -1:
-            time.sleep(0.01)
-            continue
+            if not states.global_optimizer_tasks:
+                time.sleep(0.01)
+                continue
+            idx = states.global_optimizer_tasks[0]
 
-        # Graph Construction
-        kf_idx = []
-        # k to previous consecutive keyframes
-        n_consec = 1
-        for j in range(min(n_consec, idx)):
-            kf_idx.append(idx - 1 - j)
+        neighbors = [idx - 1 - i for i in range(min(1, idx))]
         frame = keyframes[idx]
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-        kf_idx += retrieval_inds
+        retrieved = retriever.update(frame, add_after_query=True,
+                                     k=config["retrieval"]["k"],
+                                     min_thresh=config["retrieval"]["min_thresh"])
+        neighbors += retrieved
 
-        lc_inds = set(retrieval_inds)
-        lc_inds.discard(idx - 1)
-        if len(lc_inds) > 0:
-            print("Database retrieval", idx, ": ", lc_inds)
-
-        kf_idx = set(kf_idx)  # Remove duplicates by using set
-        kf_idx.discard(idx)  # Remove current kf idx if included
-        kf_idx = list(kf_idx)  # convert to list
-        frame_idx = [idx] * len(kf_idx)
-        if kf_idx:
-            factor_graph.add_factors(
-                kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
-            )
+        neighbors = list(set(neighbors) - {idx})
+        if neighbors:
+            factor_graph.add_factors(neighbors, [idx] * len(neighbors),
+                                     config["local_opt"]["min_match_frac"])
 
         with states.lock:
             states.edges_ii[:] = factor_graph.ii.cpu().tolist()
             states.edges_jj[:] = factor_graph.jj.cpu().tolist()
+            states.global_optimizer_tasks.pop(0)
 
         if config["use_calib"]:
             factor_graph.solve_GN_calib()
         else:
             factor_graph.solve_GN_rays()
 
-        with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks.pop(0)
-
-
-if __name__ == "__main__":
-    mp.set_start_method("spawn")
+# Define main function at module level
+def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
+    # Make sure to set start method if not already set
+    if mp.get_start_method(allow_none=True) is None:
+        mp.set_start_method("spawn")
+    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
     device = "cuda:0"
-    save_frames = False
-    datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
-    parser.add_argument("--config", default="config/base.yaml")
-    parser.add_argument("--save-as", default="default")
-    parser.add_argument("--no-viz", action="store_true")
-    parser.add_argument("--calib", default="")
-
-    args = parser.parse_args()
-
-    load_config(args.config)
-    print(args.dataset)
-    print(config)
-
-    manager = mp.Manager()
-    main2viz = new_queue(manager, args.no_viz)
-    viz2main = new_queue(manager, args.no_viz)
-
-    dataset = load_dataset(args.dataset)
+    load_config(config_path)
+    dataset = load_dataset(dataset_path)
     dataset.subsample(config["dataset"]["subsample"])
-    h, w = dataset.get_img_shape()[0]
 
-    if args.calib:
-        with open(args.calib, "r") as f:
-            intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
+    if calib_path:
+        with open(calib_path) as f:
+            intrinsics = yaml.safe_load(f)
         config["use_calib"] = True
         dataset.use_calibration = True
         dataset.camera_intrinsics = Intrinsics.from_calib(
             dataset.img_size,
             intrinsics["width"],
             intrinsics["height"],
-            intrinsics["calibration"],
-        )
+            intrinsics["calibration"])
 
-    keyframes = SharedKeyframes(manager, h, w)
-    states = SharedStates(manager, h, w)
-
-    if not args.no_viz:
-        viz = mp.Process(
-            target=run_visualization,
-            args=(config, states, keyframes, main2viz, viz2main),
-        )
-        viz.start()
+    height, width = dataset.get_img_shape()[0]
+    manager = mp.Manager()
+    to_viz = new_queue(manager, no_viz)
+    from_viz = new_queue(manager, no_viz)
+    keyframes = SharedKeyframes(manager, height, width)
+    print(f"Dataset length: {len(dataset)}")
+    print(f"Buffer length: {keyframes.buffer}")
+    max_frames = 4*keyframes.buffer
+    if len(dataset) > max_frames:
+        print(f"[Warning] Dataset length ({len(dataset)}) exceeds max_frames ({max_frames}).")
+        print("limiting  to avoid buffer overflow")
+    states = SharedStates(manager, height, width)
+    
+    if not no_viz:
+        viz_process = mp.Process(target=run_visualization,
+                   args=(config, states, keyframes, to_viz, from_viz))
+        viz_process.daemon = True  # This ensures the process is terminated when the main program exits
+        viz_process.start()
 
     model = load_mast3r(device=device)
     model.share_memory()
 
-    has_calib = dataset.has_calib()
-    use_calib = config["use_calib"]
+    if config["use_calib"] and not dataset.has_calib():
+        print("[Warning] Missing calibration!")
+        sys.exit(1)
 
-    if use_calib and not has_calib:
-        print("[Warning] No calibration provided for this dataset!")
-        sys.exit(0)
-    K = None
-    if use_calib:
-        K = torch.from_numpy(dataset.camera_intrinsics.K_frame).to(
-            device, dtype=torch.float32
-        )
+    K = torch.tensor(dataset.camera_intrinsics.K_frame,
+                     dtype=torch.float32, device=device) if config["use_calib"] else None
+    if K is not None:
         keyframes.set_intrinsics(K)
 
-    # remove the trajectory from the previous run
     if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        traj_file = save_dir / f"{seq_name}.txt"
-        recon_file = save_dir / f"{seq_name}.ply"
-        if traj_file.exists():
-            traj_file.unlink()
-        if recon_file.exists():
-            recon_file.unlink()
+        save_dir, seq_name = prepare_savedir(save_name, dataset)
+        for ext in (".txt", ".ply"):
+            path = save_dir / f"{seq_name}{ext}"
+            if path.exists():
+                path.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
+    
+    # Create backend process
+    backend_process = mp.Process(target=backend_loop,
+               args=(config, model, states, keyframes, K))
+    backend_process.daemon = True  # This ensures the process is terminated when the main program exits
+    backend_process.start()
 
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
-    backend.start()
-
-    i = 0
-    fps_timer = time.time()
-
+    frame_idx = 0
+    fps_start = time.time()
     frames = []
+    save_frames = False
 
-    while True:
-        mode = states.get_mode()
-        msg = try_get_msg(viz2main)
-        last_msg = msg if msg is not None else last_msg
-        if last_msg.is_terminated:
-            states.set_mode(Mode.TERMINATED)
-            break
+    try:
+        while frame_idx < len(dataset) and frame_idx <max_frames:
+            msg = try_get_msg(from_viz)
+            last_msg = msg or last_msg
 
-        if last_msg.is_paused and not last_msg.next:
-            states.pause()
-            time.sleep(0.01)
-            continue
+            if last_msg.is_terminated:
+                states.set_mode(Mode.TERMINATED)
+                break
+            if last_msg.is_paused and not last_msg.next:
+                states.pause()
+                time.sleep(0.01)
+                continue
+            if not last_msg.is_paused:
+                states.unpause()
 
-        if not last_msg.is_paused:
-            states.unpause()
+            timestamp, image = dataset[frame_idx]
+            if save_frames:
+                frames.append(image)
 
-        if i == len(dataset):
-            states.set_mode(Mode.TERMINATED)
-            break
+            T_WC = lietorch.Sim3.Identity(1, device=device) if frame_idx == 0 else states.get_frame().T_WC
+            frame = create_frame(frame_idx, image, T_WC,
+                                 img_size=dataset.img_size, device=device)
 
-        timestamp, img = dataset[i]
+            match states.get_mode():
+                case Mode.INIT:
+                    X, C = mast3r_inference_mono(model, frame)
+                    frame.update_pointmap(X, C)
+                    keyframes.append(frame)
+                    states.queue_global_optimization(len(keyframes) - 1)
+                    states.set_mode(Mode.TRACKING)
+                    states.set_frame(frame)
+                    frame_idx += 1
+
+                case Mode.TRACKING:
+                    add_kf, _, needs_reloc = tracker.track(frame)
+                    if needs_reloc:
+                        states.set_mode(Mode.RELOC)
+                    states.set_frame(frame)
+
+                    if add_kf:
+                        keyframes.append(frame)
+                        states.queue_global_optimization(len(keyframes) - 1)
+                        if config["single_thread"]:
+                            while states.global_optimizer_tasks:
+                                time.sleep(0.01)
+
+                case Mode.RELOC:
+                    X, C = mast3r_inference_mono(model, frame)
+                    frame.update_pointmap(X, C)
+                    states.set_frame(frame)
+                    states.queue_reloc()
+                    if config["single_thread"]:
+                        while states.reloc_sem.value:
+                            time.sleep(0.01)
+
+            if frame_idx % 30 == 0:
+                fps = frame_idx / (time.time() - fps_start)
+                print(f"FPS: {fps:.2f}")
+                progress = (frame_idx / min(len(dataset), max_frames)) * 100
+                print(f"Progress: {progress:.2f}%")
+
+            frame_idx += 1
+
+        if dataset.save_results:
+            save_dir, seq_name = prepare_savedir(save_name, dataset)
+            save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
+            save_reconstruction(save_dir, f"{seq_name}.ply", keyframes, last_msg.C_conf_threshold)
+            save_keyframes(save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes)
+
         if save_frames:
-            frames.append(img)
+            path = pathlib.Path(f"logs/frames/{datetime.datetime.now().isoformat()}")
+            path.mkdir(parents=True, exist_ok=True)
+            for i, img in tqdm.tqdm(enumerate(frames), total=len(frames)):
+                img = (img * 255).clip(0, 255).astype("uint8")
+                cv2.imwrite(str(path / f"{i:05}.png"), img)
+    
+    finally:
+        # Ensure we clean up processes
+        states.set_mode(Mode.TERMINATED)
+        # Give processes time to terminate gracefully
+        time.sleep(0.5)
+        
+        # Force terminate if still running
+        if backend_process.is_alive():
+            backend_process.terminate()
+        if not no_viz and viz_process.is_alive():
+            viz_process.terminate()
 
-        # get frames last camera pose
-        T_WC = (
-            lietorch.Sim3.Identity(1, device=device)
-            if i == 0
-            else states.get_frame().T_WC
-        )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset")
+    parser.add_argument("config")
+    parser.add_argument("--save_as", default="output")
+    # parser.add_argument("--no_viz", action="store_true", default = False)
+    parser.add_argument("--no_viz",  default = False)
+    parser.add_argument("--calib")
+    args = parser.parse_args()
 
-        if mode == Mode.INIT:
-            # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = mast3r_inference_mono(model, frame)
-            frame.update_pointmap(X_init, C_init)
-            keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1)
-            states.set_mode(Mode.TRACKING)
-            states.set_frame(frame)
-            i += 1
-            continue
-
-        if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track(frame)
-            if try_reloc:
-                states.set_mode(Mode.RELOC)
-            states.set_frame(frame)
-
-        elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
-            frame.update_pointmap(X, C)
-            states.set_frame(frame)
-            states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
-            while config["single_thread"]:
-                with states.lock:
-                    if states.reloc_sem.value == 0:
-                        break
-                time.sleep(0.01)
-
-        else:
-            raise Exception("Invalid mode")
-
-        if add_new_kf:
-            keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1)
-            # In single threaded mode, wait for the backend to finish
-            while config["single_thread"]:
-                with states.lock:
-                    if len(states.global_optimizer_tasks) == 0:
-                        break
-                time.sleep(0.01)
-        # log time
-        if i % 30 == 0:
-            FPS = i / (time.time() - fps_timer)
-            print(f"FPS: {FPS}")
-        i += 1
-
-    if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-        eval.save_reconstruction(
-            save_dir,
-            f"{seq_name}.ply",
-            keyframes,
-            last_msg.C_conf_threshold,
-        )
-        eval.save_keyframes(
-            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-        )
-    if save_frames:
-        savedir = pathlib.Path(f"logs/frames/{datetime_now}")
-        savedir.mkdir(exist_ok=True, parents=True)
-        for i, frame in tqdm.tqdm(enumerate(frames), total=len(frames)):
-            frame = (frame * 255).clip(0, 255)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(f"{savedir}/{i}.png", frame)
-
-    print("done")
-    backend.join()
-    if not args.no_viz:
-        viz.join()
+    # call main() with parsed args
+    main(dataset_path=args.dataset, 
+         config_path=args.config, 
+         save_name=args.save_as, 
+         no_viz=args.no_viz, 
+         calib_path=args.calib)
