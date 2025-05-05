@@ -246,6 +246,7 @@ class SharedKeyframes:
         self.is_dirty = torch.zeros(buffer, 1, device=device, dtype=torch.bool).share_memory_()
         self.K = torch.zeros(3, 3, device=device, dtype=dtype).share_memory_()
         # fmt: on
+        
 
     def __getitem__(self, idx) -> Frame:
         with self.lock:

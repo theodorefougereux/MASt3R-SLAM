@@ -94,8 +94,9 @@ def backend_loop(cfg, model, states, keyframes, K):
             factor_graph.solve_GN_rays()
 
 # Define main function at module level
-def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
+def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
     # Make sure to set start method if not already set
+    
     if mp.get_start_method(allow_none=True) is None:
         mp.set_start_method("spawn")
     
@@ -117,18 +118,15 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
             intrinsics["width"],
             intrinsics["height"],
             intrinsics["calibration"])
-
+    
     height, width = dataset.get_img_shape()[0]
     manager = mp.Manager()
     to_viz = new_queue(manager, no_viz)
     from_viz = new_queue(manager, no_viz)
-    keyframes = SharedKeyframes(manager, height, width)
+    keyframes = SharedKeyframes(manager, height, width, buffer=config.get("buffer_size",256))
     print(f"Dataset length: {len(dataset)}")
     print(f"Buffer length: {keyframes.buffer}")
-    max_frames = 4*keyframes.buffer
-    if len(dataset) > max_frames:
-        print(f"[Warning] Dataset length ({len(dataset)}) exceeds max_frames ({max_frames}).")
-        print("limiting  to avoid buffer overflow")
+   
     states = SharedStates(manager, height, width)
     
     if not no_viz:
@@ -136,10 +134,10 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
                    args=(config, states, keyframes, to_viz, from_viz))
         viz_process.daemon = True  # This ensures the process is terminated when the main program exits
         viz_process.start()
-
+  
     model = load_mast3r(device=device)
     model.share_memory()
-
+   
     if config["use_calib"] and not dataset.has_calib():
         print("[Warning] Missing calibration!")
         sys.exit(1)
@@ -169,9 +167,14 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
     fps_start = time.time()
     frames = []
     save_frames = False
-
+    
     try:
-        while frame_idx < len(dataset) and frame_idx <max_frames:
+        while frame_idx < len(dataset):
+            
+            
+            if len(keyframes) >= config["buffer_size"]-1:
+                print("Buffer full, exiting...")
+                break
             msg = try_get_msg(from_viz)
             last_msg = msg or last_msg
 
@@ -191,10 +194,11 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
 
             T_WC = lietorch.Sim3.Identity(1, device=device) if frame_idx == 0 else states.get_frame().T_WC
             frame = create_frame(frame_idx, image, T_WC,
-                                 img_size=dataset.img_size, device=device)
+                                img_size=dataset.img_size, device=device)
 
             match states.get_mode():
                 case Mode.INIT:
+                
                     X, C = mast3r_inference_mono(model, frame)
                     frame.update_pointmap(X, C)
                     keyframes.append(frame)
@@ -202,8 +206,9 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
                     states.set_mode(Mode.TRACKING)
                     states.set_frame(frame)
                     frame_idx += 1
-
+                
                 case Mode.TRACKING:
+                
                     add_kf, _, needs_reloc = tracker.track(frame)
                     if needs_reloc:
                         states.set_mode(Mode.RELOC)
@@ -217,6 +222,7 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
                                 time.sleep(0.01)
 
                 case Mode.RELOC:
+                    
                     X, C = mast3r_inference_mono(model, frame)
                     frame.update_pointmap(X, C)
                     states.set_frame(frame)
@@ -228,16 +234,20 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
             if frame_idx % 30 == 0:
                 fps = frame_idx / (time.time() - fps_start)
                 print(f"FPS: {fps:.2f}")
-                progress = (frame_idx / min(len(dataset), max_frames)) * 100
+                progress = (frame_idx / len(dataset)) * 100
                 print(f"Progress: {progress:.2f}%")
+                print("current number of keyframes: ", len(keyframes), "max number of keyframes: ", config["buffer_size"])  
 
             frame_idx += 1
+            
+                
+            
 
         if dataset.save_results:
             save_dir, seq_name = prepare_savedir(save_name, dataset)
             save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
             save_reconstruction(save_dir, f"{seq_name}.ply", keyframes, last_msg.C_conf_threshold)
-            save_keyframes(save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes)
+            save_keyframes(save_dir / "keyframes", dataset.timestamps, keyframes)
 
         if save_frames:
             path = pathlib.Path(f"logs/frames/{datetime.datetime.now().isoformat()}")
@@ -245,6 +255,7 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None):
             for i, img in tqdm.tqdm(enumerate(frames), total=len(frames)):
                 img = (img * 255).clip(0, 255).astype("uint8")
                 cv2.imwrite(str(path / f"{i:05}.png"), img)
+        
     
     finally:
         # Ensure we clean up processes
@@ -273,4 +284,5 @@ if __name__ == '__main__':
          config_path=args.config, 
          save_name=args.save_as, 
          no_viz=args.no_viz, 
-         calib_path=args.calib)
+         calib_path=args.calib, 
+    )

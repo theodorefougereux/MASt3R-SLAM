@@ -1,5 +1,6 @@
 use_calib: False
 single_thread: False
+buffer_size : 400 # seems to be the max possible for 8GB GPU
 dataset:
   subsample: 1
   img_downsample: 1

@@ -123,7 +123,6 @@ def mast3r_inference_mono(model, frame):
     feat = frame.feat
     pos = frame.pos
     shape = frame.img_true_shape
-
     res11, res21 = decoder(model, feat, feat, pos, pos, shape, shape)
     res = [res11, res21]
     X, C, D, Q = zip(
