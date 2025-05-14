@@ -94,7 +94,7 @@ def backend_loop(cfg, model, states, keyframes, K):
             factor_graph.solve_GN_rays()
 
 # Define main function at module level
-def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
+def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None, skip_frames=0):
     # Make sure to set start method if not already set
     
     if mp.get_start_method(allow_none=True) is None:
@@ -120,13 +120,17 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
             intrinsics["calibration"])
     
     height, width = dataset.get_img_shape()[0]
+    print(f"Image shape: {height}x{width}") 
     manager = mp.Manager()
     to_viz = new_queue(manager, no_viz)
     from_viz = new_queue(manager, no_viz)
     keyframes = SharedKeyframes(manager, height, width, buffer=config.get("buffer_size",256))
     print(f"Dataset length: {len(dataset)}")
     print(f"Buffer length: {keyframes.buffer}")
-   
+    
+    if skip_frames > 0:
+        print(f"Skipping first {skip_frames} frames...")
+    
     states = SharedStates(manager, height, width)
     
     if not no_viz:
@@ -163,14 +167,19 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
     backend_process.daemon = True  # This ensures the process is terminated when the main program exits
     backend_process.start()
 
-    frame_idx = 0
+    # Start frame_idx after skipping the specified number of frames
+    frame_idx = skip_frames
     fps_start = time.time()
     frames = []
     save_frames = False
     
     try:
+        # Skip the first N frames if specified
+        if skip_frames > 0:
+            print(f"Skipping first {skip_frames} frames...")
+        
+        # Main processing loop
         while frame_idx < len(dataset):
-            
             
             if len(keyframes) >= config["buffer_size"]-1:
                 print("Buffer full, exiting...")
@@ -192,7 +201,7 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
             if save_frames:
                 frames.append(image)
 
-            T_WC = lietorch.Sim3.Identity(1, device=device) if frame_idx == 0 else states.get_frame().T_WC
+            T_WC = lietorch.Sim3.Identity(1, device=device) if frame_idx == skip_frames else states.get_frame().T_WC
             frame = create_frame(frame_idx, image, T_WC,
                                 img_size=dataset.img_size, device=device)
 
@@ -232,17 +241,14 @@ def main(dataset_path, config_path, save_name, no_viz=False, calib_path=None ):
                             time.sleep(0.01)
 
             if frame_idx % 30 == 0:
-                fps = frame_idx / (time.time() - fps_start)
+                fps = (frame_idx - skip_frames) / (time.time() - fps_start)
                 print(f"FPS: {fps:.2f}")
-                progress = (frame_idx / len(dataset)) * 100
+                progress = ((frame_idx - skip_frames) / (len(dataset) - skip_frames)) * 100
                 print(f"Progress: {progress:.2f}%")
                 print("current number of keyframes: ", len(keyframes), "max number of keyframes: ", config["buffer_size"])  
 
             frame_idx += 1
             
-                
-            
-
         if dataset.save_results:
             save_dir, seq_name = prepare_savedir(save_name, dataset)
             save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
@@ -274,9 +280,11 @@ if __name__ == '__main__':
     parser.add_argument("dataset")
     parser.add_argument("config")
     parser.add_argument("--save_as", default="output")
-    # parser.add_argument("--no_viz", action="store_true", default = False)
-    parser.add_argument("--no_viz",  default = False)
+    parser.add_argument("--no_viz",  default=False)
     parser.add_argument("--calib")
+    # Add argument for skipping initial frames
+    parser.add_argument("--skip_frames", type=int, default=0, 
+                        help="Number of initial frames to skip before starting SLAM")
     args = parser.parse_args()
 
     # call main() with parsed args
@@ -284,5 +292,5 @@ if __name__ == '__main__':
          config_path=args.config, 
          save_name=args.save_as, 
          no_viz=args.no_viz, 
-         calib_path=args.calib, 
-    )
+         calib_path=args.calib,
+         skip_frames=args.skip_frames)

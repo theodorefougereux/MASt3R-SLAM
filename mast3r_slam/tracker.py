@@ -20,6 +20,8 @@ class FrameTracker:
         self.device = device
 
         self.reset_idx_f2k()
+        self.retries_count = 0
+        self.max_retries = 3
 
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
@@ -66,7 +68,7 @@ class FrameTracker:
 
         match_frac = valid_opt.sum() / valid_opt.numel()
         if match_frac < self.cfg["min_match_frac"]:
-            print(f"Skipped frame {frame.frame_id}")
+            print(f"Skipped frame {frame.frame_id} due to low match fraction")
             return False, [], True
 
         try:
@@ -88,9 +90,16 @@ class FrameTracker:
                     K,
                     img_size,
                 )
+            # Reset retries counter on success
+            self.retries_count = 0
         except Exception as e:
-            print(f"Cholesky failed {frame.frame_id}")
-            return False, [], True
+            print(f"Cholesky failed for frame {frame.frame_id}: {e}")
+            self.retries_count += 1
+            if self.retries_count > self.max_retries:
+                print(f"Maximum retries reached ({self.max_retries}), forcing relocalization")
+                self.retries_count = 0
+                return False, [], True
+            return False, [], False  # Don't force relocalization immediately, just skip this frame
 
         frame.T_WC = T_WCf
 
@@ -165,8 +174,28 @@ class FrameTracker:
         g = -A.T @ b
         cost = 0.5 * (b.T @ b).item()
 
-        L = torch.linalg.cholesky(H, upper=False)
-        tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)
+        try:
+            L = torch.linalg.cholesky(H, upper=False)
+            tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)
+        except Exception as e:
+            print(f"Cholesky decomposition failed: {e}")
+            # Try adding a small regularization term to make H positive definite
+            epsilon = 1e-6
+            H_reg = H + epsilon * torch.eye(H.shape[0], device=H.device)
+            try:
+                L = torch.linalg.cholesky(H_reg, upper=False)
+                tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)
+                print("Solved with regularization")
+            except Exception as e2:
+                print(f"Regularized Cholesky also failed: {e2}")
+                # Fallback to a more stable but less accurate method
+                try:
+                    tau_j = torch.linalg.lstsq(H, g)[0].view(1, -1)
+                    print("Used least squares fallback")
+                except Exception as e3:
+                    # If all numerical methods fail, raise the exception
+                    print(f"All numerical methods failed: {e3}")
+                    raise e3
 
         return tau_j, cost
 
