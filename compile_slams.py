@@ -3,6 +3,9 @@ import re
 import argparse
 import shutil
 import numpy as np
+from scipy.spatial import procrustes
+from scipy.interpolate import interp1d
+from sklearn.decomposition import PCA
 
 
 def quaternion_multiply(q1, q2):
@@ -49,31 +52,7 @@ def normalize_quaternion(q):
     
     return q / norm
 
-def rotate_vector_by_quaternion(v, q):
-    """
-    Rotate a 3D vector v by quaternion q
-    v: 3D vector [x, y, z]
-    q: quaternion [x, y, z, w]
-    Returns rotated vector
-    """
-    # Convert vector to pure quaternion form (0 as real part)
-    v_quat = np.array([v[0], v[1], v[2], 0])
-    
-    # q * v_quat * q^(-1)
-    q_inv = quaternion_inverse(q)
-    
-    # First multiply q * v_quat
-    temp = quaternion_multiply(q, v_quat)
-    
-    # Then multiply by q_inv
-    result_quat = quaternion_multiply(temp, q_inv)
-    
-    # Extract the vector part
-    result_vector = result_quat[:3]
-    
-    return result_vector
-
-def is_chunk_robust(chunk_poses, keyframes_folder, max_frames,max_fps,  is_last_chunk=False):
+def is_chunk_robust(chunk_poses, keyframes_folder, max_frames, max_fps, is_last_chunk=False):
     """
     Check if a SLAM chunk is robust based on criteria:
     1. Has keyframes with time > 80% of max_frames (except for last chunk)
@@ -101,7 +80,7 @@ def is_chunk_robust(chunk_poses, keyframes_folder, max_frames,max_fps,  is_last_
     
     # Check if we have keyframes with time > 80% of max_frames
     if not is_last_chunk:
-        max_expected_time = max_frames / max_fps  # Assuming 15 fps
+        max_expected_time = max_frames / max_fps
         has_late_keyframe = any(t > 0.8 * max_expected_time for t in keyframe_times)
         if not has_late_keyframe:
             return False, f"No keyframe found after {0.8 * max_expected_time:.1f}s (80% of max frames)"
@@ -142,10 +121,130 @@ def write_trajectory_file(output_folder, video_name, trajectory_idx, poses, keyf
             copied_keyframes += 1
     
     return trajectory_file, len(poses), copied_keyframes
+import numpy as np
+
+def find_rigid_transform_2d(source_points, target_points):
+    """
+    Find a rigid transformation (rotation + translation, no scaling) that best maps
+    source_points to target_points in 2D using Procrustes analysis.
+
+    Args:
+        source_points: Array of shape (n, 2) containing source point coordinates
+        target_points: Array of shape (n, 2) containing target point coordinates
+
+    Returns:
+        tuple: (rotation_matrix, translation_vector, rmse) where:
+            - rotation_matrix: 2x2 rotation matrix
+            - translation_vector: 2x1 translation vector
+            - rmse: root mean squared error of the alignment
+    """
+    source_points = np.array(source_points)
+    target_points = np.array(target_points)
+
+    if len(source_points) < 2:
+        print("Warning: Need at least 2 points for reliable rigid transform in 2D. Using identity.")
+        return np.eye(2), np.zeros(2), float('inf')
+
+    # Compute centroids
+    source_centroid = np.mean(source_points, axis=0)
+    target_centroid = np.mean(target_points, axis=0)
+
+    # Center the points
+    source_centered = source_points - source_centroid
+    target_centered = target_points - target_centroid
+
+    # Compute covariance matrix
+    covariance = target_centered.T @ source_centered
+
+    # SVD
+    U, _, Vt = np.linalg.svd(covariance)
+
+    # Handle reflection
+    det = np.linalg.det(U @ Vt)
+    # If det is negative, we need to reflect the points
+    if det < 0:
+        Vt[1, :] *= -1
+        
+    R = U @ np.diag([1, np.sign(det)]) @ Vt
+
+    # Translation
+    t = target_centroid - (R @ source_centroid)
+
+    # Compute RMSE
+    transformed = (R @ source_points.T).T + t
+    rmse = np.sqrt(np.mean(np.sum((transformed - target_points)**2, axis=1)))
+
+    return R, t, rmse
+
+
+def interpolate_poses(poses, target_times):
+    """
+    Linearly interpolate poses at specific target times
+    
+    Args:
+        poses: List of (t, x, y, z, qx, qy, qz, qw) tuples 
+        target_times: List of times at which to interpolate
+    
+    Returns:
+        List of interpolated (t, x, y, z, qx, qy, qz, qw) tuples
+    """
+    if len(poses)==0 or len(target_times)==0:
+        print("No poses or target times provided for interpolation.")
+        return []
+    
+    # Extract times and separate components
+    times = np.array([p[0] for p in poses])
+    positions = np.array([(p[1], p[2], p[3]) for p in poses])  # x, y, z
+    quaternions = np.array([(p[4], p[5], p[6], p[7]) for p in poses])  # qx, qy, qz, qw
+    
+    # Create interpolation functions for positions
+    if len(poses) > 1:
+        interp_x = interp1d(times, positions[:, 0], bounds_error=False, fill_value="extrapolate")
+        interp_y = interp1d(times, positions[:, 1], bounds_error=False, fill_value="extrapolate")
+        interp_z = interp1d(times, positions[:, 2], bounds_error=False, fill_value="extrapolate")
+        
+        # For quaternions, use linear interpolation and renormalize
+        interp_qx = interp1d(times, quaternions[:, 0], bounds_error=False, fill_value="extrapolate")
+        interp_qy = interp1d(times, quaternions[:, 1], bounds_error=False, fill_value="extrapolate")
+        interp_qz = interp1d(times, quaternions[:, 2], bounds_error=False, fill_value="extrapolate")
+        interp_qw = interp1d(times, quaternions[:, 3], bounds_error=False, fill_value="extrapolate")
+        
+        interpolated_poses = []
+        for t in target_times:
+            # Interpolate position components
+            x = float(interp_x(t))
+            y = float(interp_y(t))
+            z = float(interp_z(t))
+            
+            # Interpolate quaternion components and normalize
+            qx = float(interp_qx(t))
+            qy = float(interp_qy(t))
+            qz = float(interp_qz(t))
+            qw = float(interp_qw(t))
+            
+            # Normalize quaternion
+            qnorm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+            if qnorm > 1e-10:
+                qx /= qnorm
+                qy /= qnorm
+                qz /= qnorm
+                qw /= qnorm
+            else:
+                qx, qy, qz, qw = 0, 0, 0, 1
+            
+            interpolated_poses.append((t, x, y, z, qx, qy, qz, qw))
+    else:
+        # If we have just one pose, return it for all target times
+        interpolated_poses = [(t, poses[0][1], poses[0][2], poses[0][3], 
+                              poses[0][4], poses[0][5], poses[0][6], poses[0][7]) 
+                             for t in target_times]
+    
+    return interpolated_poses
 
 def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
     """
     Process SLAM data from multiple chunk folders and merge them into consolidated trajectories.
+    Performs PCA on each chunk to reduce to 2D and uses z=0 for all points.
     Creates separate trajectories when encountering non-robust chunks.
     
     Args:
@@ -171,7 +270,6 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
     video_name = match.group(1)
     output_folder = os.path.join(folder_slams, video_name)
     
-    
     # Calculate chunk duration in seconds (except potentially the last chunk)
     chunk_duration = max_frames / max_fps
     overlap_duration = chunk_duration * overlap
@@ -184,6 +282,12 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
     prev_chunk_poses = []
     last_successful_chunk_idx = -1
     skipped_chunks = []
+    
+    # Transformations applied to each chunk (scaling, rotation, translation)
+    chunk_transforms = [None] * len(chunk_folders)
+    
+    # Store PCA models for each chunk
+    pca_models = {}
     
     for i, chunk_name in enumerate(chunk_folders):
         chunk_folder = os.path.join(folder_slams, chunk_name)
@@ -208,7 +312,7 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
         
         # Check if this chunk is robust
         is_last_chunk = (i == len(chunk_folders) - 1)
-        is_robust, reason = is_chunk_robust(chunk_poses, keyframes_folder, max_frames,max_fps, is_last_chunk)
+        is_robust, reason = is_chunk_robust(chunk_poses, keyframes_folder, max_frames, max_fps, is_last_chunk)
         
         if not is_robust:
             print(f"Chunk {chunk_name} is not robust: {reason}")
@@ -223,6 +327,30 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
                 last_successful_chunk_idx = -1
             continue
         
+        # Extract positions for PCA
+        positions = np.array([(p[1], p[2], p[3]) for p in chunk_poses])
+        
+        # Perform PCA to reduce to 2D
+        if len(positions) >= 2:  # Need at least 2 points for PCA
+            pca = PCA(n_components=2)
+            positions_2d = pca.fit_transform(positions)
+            
+            # Store the PCA model for this chunk
+            pca_models[i] = pca
+            
+            # Replace original poses with PCA-transformed poses (z=0)
+            pca_poses = []
+            for j, (t, _, _, _, qx, qy, qz, qw) in enumerate(chunk_poses):
+                # Use the 2D coordinates from PCA with z=0
+                pca_poses.append((t, positions_2d[j][0], positions_2d[j][1], 0.0, qx, qy, qz, qw))
+            
+            chunk_poses = pca_poses
+        else:
+            print(f"Warning: Chunk {chunk_name} has fewer than 2 poses. Cannot perform PCA.")
+            # Just set z=0 for these poses
+            pca_poses = [(t, x, y, 0.0, qx, qy, qz, qw) for t, x, y, z, qx, qy, qz, qw in chunk_poses]
+            chunk_poses = pca_poses
+        
         # Calculate time offset for this chunk
         # If starting a new trajectory or it's the first chunk, start at t=0
         # Otherwise, calculate offset based on previous successful chunks
@@ -231,84 +359,89 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
         else:
             time_offset = (i - last_successful_chunk_idx) * chunk_duration - (i - last_successful_chunk_idx) * overlap_duration + last_time_offset
         
+        # ----- ALIGNMENT APPROACH FOR 2D POSITIONS AFTER PCA -----
         # If we need to align with previous chunk
         if last_successful_chunk_idx >= 0 and prev_chunk_poses:
-            # Find overlapping portion in time
+            # Define overlap regions in time
             overlap_start_prev = chunk_duration - overlap_duration
             overlap_end_prev = chunk_duration
             
             # Get poses from previous chunk in the overlap region
             prev_overlap_poses = [pose for pose in prev_chunk_poses 
-                                if overlap_start_prev <= pose[0] <= overlap_end_prev]
+                                 if overlap_start_prev <= pose[0] <= overlap_end_prev]
             
             # Get poses from current chunk in the overlap region
             current_overlap_poses = [pose for pose in chunk_poses 
-                                   if 0 <= pose[0] <= overlap_duration]
+                                    if 0 <= pose[0] <= overlap_duration]
             
-            # if prev_overlap_poses dont have any element, just take the maximum of the previous chunk
+            # If either overlap region has no poses, use endpoints
             if not prev_overlap_poses:
                 prev_overlap_poses = [prev_chunk_poses[-1]]
-            # if current_overlap_poses dont have any element, just take the minimum of the current chunk
             if not current_overlap_poses:
                 current_overlap_poses = [chunk_poses[0]]
                 
-            # Check if we have enough data for alignment
-            if prev_overlap_poses and current_overlap_poses:
-                # Find closest matching time points in the overlap
-                index_prev, index_curr = 0, 0
-                min_dist_time = float('inf')
-                for i1 in range(len(prev_overlap_poses)):
-                    for i2 in range(len(current_overlap_poses)):
-                        if abs(prev_overlap_poses[i1][0] - current_overlap_poses[i2][0]) < min_dist_time:
-                            min_dist_time = abs(prev_overlap_poses[i1][0] - current_overlap_poses[i2][0])
-                            index_prev = i1
-                            index_curr = i2
+            # Create a set of corresponding points for alignment
+            # First, create evenly spaced time points in the overlap region
+            num_samples = min(20, len(prev_overlap_poses), len(current_overlap_poses))
+            if num_samples < 2:
+                num_samples = 2  # Minimum for 2D
                 
-                # Get representative poses from each chunk
-                _, px, py, pz, pqx, pqy, pqz, pqw = prev_overlap_poses[index_prev]
-                _, cx, cy, cz, cqx, cqy, cqz, cqw = current_overlap_poses[index_curr]
+            # Sample times in the overlap region
+            overlap_times = np.linspace(0, overlap_duration, num_samples)
+            
+            # Get interpolated poses at these times
+            prev_times = [t + overlap_start_prev for t in overlap_times]
+            curr_times = overlap_times
+            prev_interp_poses = interpolate_poses(prev_overlap_poses, prev_times)
+            curr_interp_poses = interpolate_poses(current_overlap_poses, curr_times)
+            
+            # Extract 2D positions for alignment
+            prev_positions_2d = np.array([(p[1], p[2]) for p in prev_interp_poses])
+            curr_positions_2d = np.array([(p[1], p[2]) for p in curr_interp_poses])
+            
+            # Find the 2D similarity transformation (scale, rotation, translation)
+            rotation_2d, translation_2d, rmse = find_rigid_transform_2d(
+                curr_positions_2d, prev_positions_2d)
+            scale = 1 # force similitude to avoid deriving scale from slam
+            # Store the transform for this chunk
+            chunk_transforms[i] = (scale, rotation_2d, translation_2d)
+            
+            print(f"Chunk {i} 2D alignment RMSE: {rmse:.4f}, Scale: {scale:.4f}")
+            
+            # Apply the transformation to all poses in this chunk
+            transformed_poses = []
+            for t, x, y, z, qx, qy, qz, qw in chunk_poses:
+                # Transform the position (scale * R * p + t)
+                position_2d = np.array([x, y])
+                new_position_2d = scale * (rotation_2d @ position_2d) + translation_2d
                 
-                # Quaternion representation of previous and current orientations
-                prev_quat = np.array([pqx, pqy, pqz, pqw])
-                curr_quat = np.array([cqx, cqy, cqz, cqw])
+                # For orientation quaternions, we need to derive a 3D rotation from our 2D rotation
+                # The 2D rotation is in the XY plane, so we can extend it to 3D
+                # by adding a z-axis that doesn't rotate
+                cos_theta = rotation_2d[0, 0]  # Cosine of rotation angle
+                sin_theta = rotation_2d[1, 0]  # Sine of rotation angle
                 
-                # Compute rotation that takes current to previous
-                rot_quat = quaternion_multiply(prev_quat, quaternion_inverse(curr_quat))
+                # Create quaternion for rotation around Z axis
+                rot_angle = np.arctan2(sin_theta, cos_theta)  # Extract rotation angle
+                rot_x = 0
+                rot_y = 0
+                rot_z = np.sin(rot_angle / 2)
+                rot_w = np.cos(rot_angle / 2)
                 
-                # Previous and current positions
-                prev_pos = np.array([px, py, pz])
-                curr_pos = np.array([cx, cy, cz])
+                rot_quat = normalize_quaternion(np.array([rot_x, rot_y, rot_z, rot_w]))
+                pose_quat = np.array([qx, qy, qz, qw])
                 
-                # Rotate current position using the rotation quaternion
-                rotated_curr_pos = rotate_vector_by_quaternion(curr_pos, rot_quat)
+                # Apply rotation to orientation quaternion
+                new_quat = quaternion_multiply(rot_quat, pose_quat)
+                new_quat = normalize_quaternion(new_quat)
                 
-                # Calculate translation after rotation
-                translation = prev_pos - rotated_curr_pos
-                
-                # Transform all poses in current chunk
-                transformed_poses = []
-                for t, x, y, z, qx, qy, qz, qw in chunk_poses:
-                    # Apply rotation to position
-                    pos = np.array([x, y, z])
-                    quat = np.array([qx, qy, qz, qw])
-                    
-                    # Rotate the position vector
-                    rotated_pos = rotate_vector_by_quaternion(pos, rot_quat)
-                    
-                    # Apply translation
-                    new_pos = rotated_pos + translation
-                    
-                    # Apply rotation to orientation quaternion
-                    new_quat = quaternion_multiply(rot_quat, quat)
-                    new_quat = normalize_quaternion(new_quat)
-                    
-                    transformed_poses.append((
-                        t, 
-                        new_pos[0], new_pos[1], new_pos[2], 
-                        new_quat[0], new_quat[1], new_quat[2], new_quat[3]
-                    ))
-                
-                chunk_poses = transformed_poses
+                transformed_poses.append((
+                    t, 
+                    new_position_2d[0], new_position_2d[1], 0.0,  # z is always 0
+                    new_quat[0], new_quat[1], new_quat[2], new_quat[3]
+                ))
+            
+            chunk_poses = transformed_poses
         
         # Store current chunk poses for alignment with next chunk
         prev_chunk_poses = chunk_poses
@@ -336,7 +469,8 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
                 include_pose = normalized_pos_in_overlap < 0.5
             
             if include_pose:
-                current_trajectory_poses.append((adjusted_time, x, y, z, qx, qy, qz, qw))
+                # Make sure z is always 0
+                current_trajectory_poses.append((adjusted_time, x, y, 0.0, qx, qy, qz, qw))
                 
                 # Check and record if this is a keyframe
                 keyframe_file = f"{t}.png"
@@ -358,6 +492,9 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
         # Sort poses by adjusted time
         poses.sort(key=lambda x: x[0])
         
+        # Ensure Z coordinate is always 0
+        poses = [(t, x, y, 0.0, qx, qy, qz, qw) for t, x, y, z, qx, qy, qz, qw in poses]
+        
         # Write trajectory file
         trajectory_file, num_poses, num_keyframes = write_trajectory_file(
             output_folder, video_name, idx, poses, keyframe_mappings
@@ -369,7 +506,7 @@ def process_slams(folder_slams, chunk_folders, overlap, max_frames, max_fps):
 
 def main():
     """Main function to process SLAM data from command line arguments"""
-    parser = argparse.ArgumentParser(description="Process chunked slam files")
+    parser = argparse.ArgumentParser(description="Process chunked slam files with PCA")
     parser.add_argument(
         "--folder_slams",
         type=str,
@@ -430,7 +567,7 @@ def main():
 def main_with_config(config):
     """Alternative main function that accepts a config dictionary"""
     root = config["general"]["root"]
-    folder_slams = str(root)+ config["slam"]["log_path"]
+    folder_slams = str(root) + config["slam"]["log_path"]
     overlap = config["preprocess"]["overlap"]
     max_frames = config["preprocess"]["max_frames_per_video"]
     max_fps = config["preprocess"]["max_fps"]
